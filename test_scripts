@@ -316,25 +316,23 @@ class SpendScripts(object):
 
 bitcoin.SelectParams('regtest')
 
+# parameters
+
 spend = CBitcoinSecret("cVFfsB2h1KHgPEWtpXrnZ5qjk18xw2o2fuxCTaf7BN2Z5PSvhq4M")
 refund = CBitcoinSecret("cRKSxo1yJKP1RwaHULWaumNYiyXiQu2tRGdTmUxzP1s4YeSM4ks1")
 sec = b'A pair of boiled eggs for lunch?'
 sechash = Hash160(sec)
-
-#rcptR = ReceiptScript(spend.pub, refund.pub, sechash, 230, refund)
-#rcptS = ReceiptScript(spend.pub, refund.pub, sechash, 230, spend, sec)
-
 rev = x('4a120469b397556363c4e47f45d8f81b381f721af89baba372425f820ae7077c')
 revhash = Hash160(rev)
 
+# the two scripts: paying me or paying them (or refunding to me)
 htlcA = HTLCScript(spend.pub, refund.pub, sechash, 230,
                    revhash, 'pay', 10)
 htlcB = HTLCScript(spend.pub, refund.pub, sechash, 230,
                    revhash, 'refund', 10)
 
-print(htlcA.p2sh_addr, b2x(htlcA.script))
-print(htlcB.p2sh_addr, b2x(htlcB.script))
-
+# the six ways of resolving the scripts: spending, refunding or revoking,
+# for both types of script
 htlcAs = HTLCScript(spend.pub, refund.pub, sechash, 230,
                    revhash, 'pay', 10, privkey=spend, secret_pre=sec)
 htlcAr = HTLCScript(spend.pub, refund.pub, sechash, 230,
@@ -348,6 +346,7 @@ htlcBr = HTLCScript(spend.pub, refund.pub, sechash, 230,
 htlcBv = HTLCScript(spend.pub, refund.pub, sechash, 230,
                    revhash, 'refund', 10, privkey=refund, revoke_pre=rev)
 
+# check that the scripts didn't change, just because how we spend the does
 assert htlcA.script == htlcAs.script
 assert htlcA.script == htlcAr.script
 assert htlcA.script == htlcAv.script
@@ -358,6 +357,9 @@ assert htlcB.script == htlcBv.script
 print("P:", htlcA.p2sh_addr, b2x(htlcA.script))
 print("R:", htlcB.p2sh_addr, b2x(htlcB.script))
 
+# when testing, run the script up to here to get the two spend addresses,
+# then create three outputs for each of them, and enter the values below
+
 r_txns = [
  (htlcAs, 0,"69ed5e5467ef8e7ddea15410403f45b002c0cd73ae86d35a1e64a50c32dfec99"),
  (htlcAr, 1,"25a4f6911b987fc3582d7f68713949e3a15d60f219d02901a6f9cc9635481809"),
@@ -367,6 +369,7 @@ r_txns = [
  (htlcBv, 1,"c60d10aa967e04d0b3ea092869c84cfb278c4e559380106880612256f41623c3"),
 ]
 
+# what address does the money finally go to?
 spend = SpendScripts("n19pAJZ6FkxwByT5k4XR9knxwHzkMts39x")
 for r, vout, txid in r_txns:
     print(vout, txid)
