@@ -1,0 +1,374 @@
+#!/usr/bin/env python3
+
+# have to use python3 because otherwise bytes() is freaking weird
+
+import bitcoin
+import bitcoin.rpc
+import hashlib
+
+from bitcoin.core import (
+        b2x, x, b2lx, lx,
+        Hash160,
+        str_money_value, COIN,
+        COutPoint, CTxIn, CMutableTxIn, CTxOut,
+        CTransaction, CMutableTransaction,
+)
+from bitcoin.core.script import (
+        OP_IF, OP_NOTIF, OP_ELSE, OP_ENDIF, OP_SHA256, OP_HASH160,
+        OP_VERIFY, OP_EQUALVERIFY, OP_EQUAL, OP_BOOLOR,
+        OP_NOP2, OP_NOP3, OP_IFDUP, OP_DUP, OP_DROP, OP_2DROP,
+        OP_CHECKSIG, OP_CHECKSIGVERIFY,
+        OP_SWAP, OP_OVER, OP_CODESEPARATOR, OP_FALSE, OP_TRUE, OP_2,
+        CScript,
+        SignatureHash, SIGHASH_ALL,
+)
+LOCKTIME_THRESHOLD = 500000000
+
+OP_CLTV = OP_HODL = OP_NOP2
+OP_CSV = OP_NOP3
+
+from bitcoin.wallet import P2SHBitcoinAddress, CBitcoinSecret, CBitcoinAddress
+
+def mkhash(basescript, tx, vin, sigflags, drop_codesep=0):
+    if drop_codesep > 0:
+        sclst = list(basescript)
+        assert basescript == CScript(sclst) # not fancy
+        for _ in range(dropcs):
+            assert OP_CODESEPARATOR in sclst
+            sclst = sclst[sclst.index(OP_CODESEPARATOR)+1:]
+        basescript = CScript(sclst)
+    return SignatureHash(basescript, tx, vin, sigflags)
+
+def mksig(privkey, txhash, sigflags, N=None):
+    if N is None:
+        return privkey.sign(txhash) + bytes([sigflags])
+    else:
+        nhash = int.from_bytes(txhash, byteorder='big')
+        pkb = privkey.to_bytes()
+        if len(pkb) == 33 and pkb[-1] == 1:
+            pkb = pkb[:32]
+        assert len(pkb) == 32
+        sk = ecdsa.SigningKey.from_string(pkb, curve=ecdsa.SECP256k1)
+        sig = sk.privkey.sign(nhash, N)
+        if sig.s*2 > ecdsa.SECP256k1.order:
+            sig.s = ecdsa.SECP256k1.order - sig.s
+        return ecdsa.util.sigencode_der(sig.r, sig.s, None) + bytes([sigflags])
+
+class Script(object):
+    @property
+    def p2sh_scriptPubKey(self):
+        return self.script.to_p2sh_scriptPubKey()
+
+    @property
+    def p2sh_addr(self):
+        return P2SHBitcoinAddress.from_redeemScript(self.script)
+
+    @property
+    def spendbytes(self):
+        # redeemscript and one sig
+        return len(self.script) + 70 + 2
+
+    def mutate_spend(self, tx, vin):
+        pass
+    def sign_spend(self, tx, vin):
+        pass
+
+    def bump_delay(self, tx, vin, delay):
+        assert 0 < delay < 2**16
+        if tx.nVersion < 2:
+            tx.nVersion = 2
+        seq = tx.vin[vin].nSequence
+        assert seq == 0xFFFFFFFF or seq & 0x80000000 == 0
+        if seq == 0xFFFFFFFF:
+            d = 0
+        d = seq & 0xFFFF
+        if d < delay:
+            d = delay
+        otx = tx.vin[vin]
+        tx.vin[vin] = CTxIn(otx.prevout, otx.scriptSig, d)
+
+    def bump_locktime(self, tx, timeout):
+        if tx.nLockTime != 0:
+            tx_blk = tx.nLockTime < LOCKTIME_THRESHOLD
+            to_blk = timeout < LOCKTIME_THRESHOLD
+            if (tx_blk and not to_blk):
+                raise Exception("Cannot HODL to block time when transaction is already locked by block height")
+            elif (not tx_blk and to_blk):
+                raise Exception("Cannot HODL to block height when transaction is already locked by block time")
+
+        if tx.nLockTime < timeout:
+            tx.nLockTime = timeout
+
+class HODLScript(Script):
+    def __init__(self, privkey, timeout, pubkey=None):
+        if pubkey is None:
+            pubkey = privkey.pub
+        self.privkey = privkey
+        self.pubkey = pubkey
+        self.timeout = timeout
+
+    @property
+    def script(self):
+        return CScript([self.timeout, OP_CLTV, OP_DROP,
+                        self.pubkey, OP_CHECKSIG])
+
+    def mutate_spend(self, tx, vin):
+        self.bump_locktime(tx, self.timeout)
+
+    def sign_spend(self, tx, vin):
+        txhash = mkhash(self.script, tx, vin, SIGHASH_ALL)
+        sig = mksig(self.privkey, txhash, SIGHASH_ALL)
+        assert bitcoin.core.script.IsLowDERSignature(sig)
+        return CScript([sig, self.script])
+
+class ReceiptScript(Script):
+    def __init__(self, paypubkey, refundpubkey,
+            secret, timeout,
+            privkey=None, secret_pre=None,
+            secret_type='sha'):
+
+        assert secret_type == 'sha'
+        assert len(secret) == 32
+        assert secret_pre is None or len(secret_pre) == 32
+
+        if secret_pre is not None:
+            assert privkey is not None
+            assert privkey.pub == paypubkey
+            assert hashlib.sha256(secret_pre).digest() == secret
+        elif privkey is not None:
+            assert privkey.pub == refundpubkey
+
+        self.paypubkey = paypubkey
+        self.refundpubkey = refundpubkey
+        self.secret = secret
+        self.timeout = timeout
+        self.privkey = privkey
+        self.secret_pre = secret_pre
+        self.secret_type = secret_type
+
+    @property
+    def script(self):
+        return CScript([
+            OP_IF, OP_SHA256, self.secret, OP_EQUALVERIFY, self.paypubkey,
+            OP_ELSE, self.timeout, OP_CLTV, OP_DROP, self.refundpubkey,
+            OP_ENDIF, OP_CHECKSIG])
+
+    def mutate_spend(self, tx, vin):
+        if self.secret_pre is None:
+            self.bump_locktime(tx, self.timeout)
+
+    def sign_spend(self, tx, vin):
+        txhash = mkhash(self.script, tx, vin, SIGHASH_ALL)
+        sig = mksig(self.privkey, txhash, SIGHASH_ALL)
+        if self.secret_pre is not None:
+            return CScript([sig, self.secret_pre, OP_TRUE, self.script])
+        else:
+            return CScript([sig, OP_FALSE, self.script])
+
+class HTLCScript(Script):
+    _h_nil = Hash160(b"")
+    _h_1 = Hash160(b"\x01")
+
+    def __init__(self, paypubkey, refundpubkey,
+            secret, timeout,
+            revoke, revoke_side, delay,
+            privkey=None, secret_pre=None, revoke_pre=None,
+            secret_type='sha'):
+
+        assert revoke_side in ["pay", "refund"]
+        assert secret_type == 'sha'
+
+        assert len(secret) == 20
+        assert secret_pre is None or len(secret_pre) == 32
+
+        assert len(revoke) == 20
+
+        if revoke_pre is not None:
+            assert len(revoke_pre) == 32
+            assert Hash160(revoke_pre) == revoke
+            assert secret_pre is None
+            assert privkey is not None
+            assert privkey.pub == (paypubkey if revoke_side == "pay" 
+                                   else refundpubkey)
+        elif secret_pre is not None:
+            assert privkey is not None
+            assert privkey.pub == paypubkey
+            assert Hash160(secret_pre) == secret
+        elif privkey is not None:
+            assert privkey.pub == refundpubkey
+            if self._h_nil not in [revoke, secret]:
+                self.timeout_pre = OP_FALSE
+            elif self._h_1 not in [revoke, secret]:
+                self.timeout_pre = OP_TRUE
+            else:
+                self.timeout_pre = OP_2
+
+        self.paypubkey = paypubkey
+        self.refundpubkey = refundpubkey
+        self.secret = secret
+        self.timeout = timeout
+        self.privkey = privkey
+        self.secret_pre = secret_pre
+        self.secret_type = secret_type
+        self.delay = delay
+        self.revoke_side = revoke_side
+        self.revoke = revoke
+        self.revoke_pre = revoke_pre
+
+    @property
+    def script(self):
+        if self.revoke_side == "pay":
+            # ((revoke|secret) & pay) | (csv & cltv & refund)
+            return CScript([
+                OP_HASH160, OP_DUP, self.secret, OP_EQUAL,
+                  OP_SWAP, self.revoke, OP_EQUAL, OP_BOOLOR,
+                OP_IF, self.paypubkey,
+                OP_ELSE,
+                  self.delay, OP_CSV, self.timeout, OP_CLTV, OP_2DROP,
+                  self.refundpubkey,
+                OP_ENDIF, OP_CHECKSIG])
+        else:
+            # (csv & secret & pay) | ((revoke | cltv) & refund)
+            return CScript([
+                OP_HASH160, OP_DUP, self.secret, OP_EQUAL,
+                OP_IF, self.delay, OP_CSV, OP_2DROP, self.paypubkey,
+                OP_ELSE, self.revoke, OP_EQUAL,
+                  OP_NOTIF, self.timeout, OP_CLTV, OP_DROP, OP_ENDIF,
+                  self.refundpubkey,
+                OP_ENDIF, OP_CHECKSIG])
+
+    def mutate_spend(self, tx, vin):
+        if self.revoke_pre is None:
+            if self.secret_pre is not None:
+                self.bump_locktime(tx, self.timeout)
+            if self.revoke_side == "pay":
+                if self.secret_pre is None:
+                    self.bump_delay(tx, vin, self.delay)
+            else:
+                if self.secret_pre is not None:
+                    self.bump_delay(tx, vin, self.delay)
+
+    def sign_spend(self, tx, vin):
+        assert self.privkey is not None
+
+        txhash = mkhash(self.script, tx, vin, SIGHASH_ALL)
+        sig = mksig(self.privkey, txhash, SIGHASH_ALL)
+        if self.revoke_pre is not None:
+            return CScript([sig, self.revoke_pre, self.script])
+        elif self.secret_pre is not None:
+            return CScript([sig, self.secret_pre, self.script])
+        else:
+            return CScript([sig, self.timeout_pre, self.script])
+
+class SpendScripts(object):
+    def __init__(self, payto_addr):
+        self.payto = CBitcoinAddress(payto_addr)
+        self.proxy = bitcoin.rpc.Proxy()
+        self.prevouts = []
+
+    def add_prevout(self, txid, vout, redeemer):
+        outpoint = COutPoint(lx(txid), vout)
+        try:
+            prevout = self.proxy.gettxout(outpoint)
+        except IndexError:
+            raise Exception("Outpoint %s not found" % (outpoint,))
+        prevtx = prevout['txout']
+        if prevtx.scriptPubKey != redeemer.p2sh_scriptPubKey:
+            raise Exception("Outpoint %s has incorrect scriptPubKey (%s; expected %s)" % (outpoint, b2x(prevtx.scriptPubKey), b2x(redeemer.p2sh_scriptPubKey)))
+        self.prevouts.append((outpoint, prevtx, redeemer))
+
+    def as_tx(self):
+        sum_in = sum(prevtx.nValue for _,prevtx,_ in self.prevouts)
+        sig_size = sum(redeemer.spendbytes for _,_,redeemer in self.prevouts)
+        tx_size = (4                        + # version field
+                   2                        + # # of txins
+                   len(self.prevouts) * 41  + # txins, excluding sigs
+                   sig_size                 + # txins, sigs only
+                   1                        + # # of txouts
+                   34                       + # txout
+                   4                          # nLockTime field
+                   )
+        feerate = int(self.proxy._call('estimatefee', 1) * COIN) 
+        # satoshi's per KB
+        if feerate <= 0:
+            feerate = 10000
+        fees = int(tx_size * feerate / 1000)
+
+        tx = CMutableTransaction(
+                [CTxIn(outpoint, nSequence=0)
+                    for outpoint,_,_ in self.prevouts],
+                [CTxOut(sum_in - fees, self.payto.to_scriptPubKey())],
+                0)
+
+        for n,(_,_,redeemer) in enumerate(self.prevouts):
+            redeemer.mutate_spend(tx, n)
+
+        unsigned_tx = CTransaction.from_tx(tx)
+
+        for n,(_,_,redeemer) in enumerate(self.prevouts):
+            txin = CMutableTxIn.from_txin(tx.vin[n])
+            txin.scriptSig = redeemer.sign_spend(unsigned_tx, n)
+            tx.vin[n] = CTxIn.from_txin(txin)
+
+        print(b2x(tx.serialize()))
+
+bitcoin.SelectParams('regtest')
+
+spend = CBitcoinSecret("cVFfsB2h1KHgPEWtpXrnZ5qjk18xw2o2fuxCTaf7BN2Z5PSvhq4M")
+refund = CBitcoinSecret("cRKSxo1yJKP1RwaHULWaumNYiyXiQu2tRGdTmUxzP1s4YeSM4ks1")
+sec = b'A pair of boiled eggs for lunch?'
+sechash = Hash160(sec)
+
+#rcptR = ReceiptScript(spend.pub, refund.pub, sechash, 230, refund)
+#rcptS = ReceiptScript(spend.pub, refund.pub, sechash, 230, spend, sec)
+
+rev = x('4a120469b397556363c4e47f45d8f81b381f721af89baba372425f820ae7077c')
+revhash = Hash160(rev)
+
+htlcA = HTLCScript(spend.pub, refund.pub, sechash, 230,
+                   revhash, 'pay', 10)
+htlcB = HTLCScript(spend.pub, refund.pub, sechash, 230,
+                   revhash, 'refund', 10)
+
+print(htlcA.p2sh_addr, b2x(htlcA.script))
+print(htlcB.p2sh_addr, b2x(htlcB.script))
+
+htlcAs = HTLCScript(spend.pub, refund.pub, sechash, 230,
+                   revhash, 'pay', 10, privkey=spend, secret_pre=sec)
+htlcAr = HTLCScript(spend.pub, refund.pub, sechash, 230,
+                   revhash, 'pay', 10, privkey=refund)
+htlcAv = HTLCScript(spend.pub, refund.pub, sechash, 230,
+                   revhash, 'pay', 10, privkey=spend, revoke_pre=rev)
+htlcBs = HTLCScript(spend.pub, refund.pub, sechash, 230,
+                   revhash, 'refund', 10, privkey=spend, secret_pre=sec)
+htlcBr = HTLCScript(spend.pub, refund.pub, sechash, 230,
+                   revhash, 'refund', 10, privkey=refund)
+htlcBv = HTLCScript(spend.pub, refund.pub, sechash, 230,
+                   revhash, 'refund', 10, privkey=refund, revoke_pre=rev)
+
+assert htlcA.script == htlcAs.script
+assert htlcA.script == htlcAr.script
+assert htlcA.script == htlcAv.script
+assert htlcB.script == htlcBs.script
+assert htlcB.script == htlcBr.script
+assert htlcB.script == htlcBv.script
+
+print("P:", htlcA.p2sh_addr, b2x(htlcA.script))
+print("R:", htlcB.p2sh_addr, b2x(htlcB.script))
+
+r_txns = [
+ (htlcAs, 0,"69ed5e5467ef8e7ddea15410403f45b002c0cd73ae86d35a1e64a50c32dfec99"),
+ (htlcAr, 1,"25a4f6911b987fc3582d7f68713949e3a15d60f219d02901a6f9cc9635481809"),
+ (htlcAv, 0,"ba63dab2bfed317d57e7863abd2d5deb23d54061ba09055126108b502e242125"),
+ (htlcBs, 1,"8a15c23a5855f04b9ff20ac4dc58e52242901466880112e5fb4df5ae478210c5"),
+ (htlcBr, 1,"91abebe0401617f26cf8a49d732295d8dcac1bd8a798ca42c8e70252b47e2777"),
+ (htlcBv, 1,"c60d10aa967e04d0b3ea092869c84cfb278c4e559380106880612256f41623c3"),
+]
+
+spend = SpendScripts("n19pAJZ6FkxwByT5k4XR9knxwHzkMts39x")
+for r, vout, txid in r_txns:
+    print(vout, txid)
+    spend.add_prevout(txid, vout, r)
+spend.as_tx()
+
+
