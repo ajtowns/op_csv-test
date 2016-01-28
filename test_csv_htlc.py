@@ -361,16 +361,21 @@ print("R:", htlcB.p2sh_addr, b2x(htlcB.script))
 # then create three outputs for each of them, and enter the values below
 
 r_txns = [
- (htlcAs, 0,"69ed5e5467ef8e7ddea15410403f45b002c0cd73ae86d35a1e64a50c32dfec99"),
- (htlcAr, 1,"25a4f6911b987fc3582d7f68713949e3a15d60f219d02901a6f9cc9635481809"),
- (htlcAv, 0,"ba63dab2bfed317d57e7863abd2d5deb23d54061ba09055126108b502e242125"),
- (htlcBs, 1,"8a15c23a5855f04b9ff20ac4dc58e52242901466880112e5fb4df5ae478210c5"),
- (htlcBr, 1,"91abebe0401617f26cf8a49d732295d8dcac1bd8a798ca42c8e70252b47e2777"),
- (htlcBv, 1,"c60d10aa967e04d0b3ea092869c84cfb278c4e559380106880612256f41623c3"),
+# OP_CSV (and OP_CLTV on refund)
+ (htlcAr, 1,"4438112474f70960999c563c289bacf74aa7806fd66c70afeac41a86fcc430cb"),
+ (htlcBs, 1,"636c4e0effeacbb5bdc987737f19fab1bf85582d1e27efea7bf5f449f760f87c"),
+
+# no OP_CSV (OP_CLTV on refund)
+ (htlcAs, 0,"1521725c01c57de63e51c482e71c0fe1a5be3f0d5c903ff79418aef282dcf30a"),
+ (htlcBr, 1,"3c01f185b5f26691d539e5c061e09c6bb8477905ed014b809b25afaeb7f950c7"),
+
+# no delays
+ (htlcAv, 0,"4fec5311713b5fd3b1fe34b5ca935d299ef775c2b06a7439ece5f422ef1b3643"),
+ (htlcBv, 0,"b878f90c389a152cd52a58b3e433eb070b7eb4dc6ecc2a01815eb3461c6fecf9"),
 ]
 
 # what address does the money finally go to?
-spend = SpendScripts("n19pAJZ6FkxwByT5k4XR9knxwHzkMts39x")
+spend = SpendScripts("mq849rB4FrMomQ1gB3RfyygDeALYzrcytR")
 for r, vout, txid in r_txns:
     print(vout, txid)
     spend.add_prevout(txid, vout, r)
